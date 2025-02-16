@@ -1,0 +1,103 @@
+stages:
+  - build
+  - deploy
+
+variables:
+  # 基础配置
+  DOCKERFILE_PATH: "devops/dev/Dockerfile"
+  APP_NAME: "web-test"
+  NAMESPACE: "openui-sit"
+  AWS_REGION: "cn-north-1" # 根据实际情况调整区域
+  ECR_REGISTRY: "your-company-ecr-registry.cn-north-1.amazonaws.com.cn" # 替换为实际ECR地址
+  IMAGE_TAG: "${CI_COMMIT_SHORT_SHA}"
+
+# 使用带有必要工具的官方镜像
+image: 
+  name: amazon/aws-cli:2.13.0
+  entrypoint: [""]
+
+before_script:
+  - echo "========== 初始化配置 =========="
+  - apt-get update && apt-get install -y docker.io kubectl
+  - aws configure set aws_access_key_id ${AWS_ACCESS_KEY_ID}
+  - aws configure set aws_secret_access_key ${AWS_SECRET_ACCESS_KEY}
+  - aws configure set region ${AWS_REGION}
+
+build-image:
+  stage: build
+  script:
+    - echo "========== 构建Docker镜像 =========="
+    - docker build \
+        -f ${DOCKERFILE_PATH} \
+        -t ${ECR_REGISTRY}/${APP_NAME}:${IMAGE_TAG} \
+        --build-arg USE_CUDA=false \
+        --build-arg USE_OLLAMA=false \
+        .
+
+    - echo "========== 推送镜像到ECR =========="
+    - aws ecr get-login-password | docker login --username AWS --password-stdin ${ECR_REGISTRY}
+    - docker push ${ECR_REGISTRY}/${APP_NAME}:${IMAGE_TAG}
+
+deploy-eks:
+  stage: deploy
+  script:
+    - echo "========== 配置Kubernetes访问 =========="
+    - mkdir -p ~/.kube
+    - echo "${KUBE_CONFIG}" > ~/.kube/config
+    - chmod 600 ~/.kube/config
+
+    - echo "========== 生成部署清单 =========="
+    - cat <<EOF > deployment.yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: ${APP_NAME}
+  namespace: ${NAMESPACE}
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: ${APP_NAME}
+  template:
+    metadata:
+      labels:
+        app: ${APP_NAME}
+    spec:
+      containers:
+      - name: webui
+        image: ${ECR_REGISTRY}/${APP_NAME}:${IMAGE_TAG}
+        ports:
+        - containerPort: 8080
+        envFrom:
+        - secretRef:
+            name: webui-env
+        resources:
+          requests:
+            cpu: "500m"
+            memory: "1Gi"
+          limits:
+            cpu: "1"
+            memory: "2Gi"
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: ${APP_NAME}-service
+  namespace: ${NAMESPACE}
+spec:
+  selector:
+    app: ${APP_NAME}
+  ports:
+    - protocol: TCP
+      port: 80
+      targetPort: 8080
+  type: ClusterIP
+EOF
+
+    - echo "========== 应用部署配置 =========="
+    - kubectl apply -f deployment.yaml
+    - echo "========== 检查部署状态 =========="
+    - kubectl rollout status deployment/${APP_NAME} -n ${NAMESPACE} --timeout=120s
+
+  only:
+    - main # 仅在main分支触发部署
